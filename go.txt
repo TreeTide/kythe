@@ -1,0 +1,2 @@
+time CGO_LDFLAGS="-lleveldb" GOPATH=~/gopath go build kythe/go/storage/tools/read_to_pg/read_to_pg.go
+time DATABASE_URL=postgresql:///kydb?host=/mnt/data/pyurlex/postgres/postgres ./read_to_pg -graphstore /mnt/data/kythe/kythe_repo/gs3.top

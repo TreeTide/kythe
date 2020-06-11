@@ -20,6 +20,7 @@ require (
 	github.com/google/subcommands v1.0.1
 	github.com/google/uuid v1.1.1
 	github.com/hanwen/go-fuse v1.0.0
+	github.com/jackc/pgx/v4 v4.6.0 // indirect
 	github.com/jmhodges/levigo v1.0.0
 	github.com/jstemmer/go-junit-report v0.9.1 // indirect
 	github.com/mholt/archiver v3.1.1+incompatible
