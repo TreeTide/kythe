@@ -131,7 +131,7 @@ func (s *BatchState) finalizeBatch() {
   sigHash := s.siglHash(src)
 
   s.batchCounter++
-  shouldRecord := s.batchCounter % 100 == 0
+  shouldRecord := s.batchCounter % 100 < 10
 
   if shouldRecord {
     // subsampled
@@ -142,24 +142,35 @@ func (s *BatchState) finalizeBatch() {
   fmt.Printf("%v %v %v %v\n", s.kind, s.startByte, s.endByte, s.childofSigl)
   */
 
+    // First try: same data, but in arrays instead separate rows.
+    ekinds := make([]int32, 0, 5)
+    tcrps := make([]uint64, 0, 5)
+    tsigls := make([]uint64, 0, 5)
     if s.kind == scpb.NodeKind_ANCHOR {
       for _, e := range s.batch {
         ekind := schema.EdgeKind(string(e.EdgeKind))
         tcrp := s.crpHash(e.Target)
         tsigl := s.siglHash(e.Target)
+
+        ekinds = append(ekinds, int32(ekind))
+        tcrps = append(tcrps, tcrp)
+        tsigls = append(tsigls, tsigl)
+
+         // CREATE TABLE anchor_old (crp bigint NOT NULL, sigl bigint NOT NULL, psigl bigint NOT NULL, bs int NOT NULL, be int NOT NULL, ekind int NOT NULL, tcrp bigint NOT NULL, tsigl bigint NOT NULL);
+        //s.dbBatch.Queue("INSERT INTO anchor_old (crp, sigl, psigl, bs, be, ekind, tcrp, tsigl) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", pathHash, sigHash, s.childofSigl, s.startByte, s.endByte, ekind, tcrp, tsigl)
+      }
         //fmt.Printf("%v %v %v\n", ekind, s.crpHash(e.Target), s.siglHash(e.Target))
 
         /*
-         CREATE TABLE anchor (crp bigint, sigl bigint, psigl bigint, bs int, be int, ekind int, tcrp bigint, tsigl bigint);
+         CREATE TABLE anchor (crp bigint NOT NULL, sigl bigint NOT NULL, psigl bigint NOT NULL, bs int NOT NULL, be int NOT NULL, ekinds int[] NOT NULL, tcrps bigint[] NOT NULL, tsigls bigint[] NOT NULL);
 
          CREATE TABLE crp (crp BIGINT, corpus TEXT, root TEXT, path TEXT);
         */
           // so so we only get crp assignment
-        s.dbBatch.Queue("INSERT INTO anchor (crp, sigl, psigl, bs, be, ekind, tcrp, tsigl) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", pathHash, sigHash, s.childofSigl, s.startByte, s.endByte, ekind, tcrp, tsigl)
+      s.dbBatch.Queue("INSERT INTO anchor (crp, sigl, psigl, bs, be, ekinds, tcrps, tsigls) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", pathHash, sigHash, s.childofSigl, s.startByte, s.endByte, ekinds, tcrps, tsigls)
 
-        s.dbBatchCount += 1
-        s.insertBatch(false)
-      }
+      s.dbBatchCount += 1
+      s.insertBatch(false)
       // TODO collect: ref, defines/binding, childof
     }
 
