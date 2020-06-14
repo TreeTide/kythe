@@ -40,7 +40,7 @@ import (
 	_ "kythe.io/kythe/go/services/graphstore/proxy"
 	_ "kythe.io/kythe/go/storage/leveldb"
 
-  "github.com/golang/protobuf/proto"
+  //"github.com/golang/protobuf/proto"
   "github.com/jackc/pgx/v4"
 
   "hash"
@@ -71,18 +71,41 @@ type BatchState struct {
   dbConn *pgx.Conn
   dbBatch *pgx.Batch
   dbBatchCount int
+
+  latestCrp int64
+  sigl int64
   batch []*(spb.Entry)
+
   kind scpb.NodeKind
   startByte int
   endByte int
-  childofSigl uint64
+
+  sigls []int64
+  ekinds []int32
+  tcrps []int64
+  tsigls []int64
+  bss []int
+  bes []int
+  //childofSigl uint64
 }
 
 func (s *BatchState) processEntry(entry *spb.Entry) error {
-  if len(s.batch) == 0 || proto.Equal(s.batch[0].Source, entry.Source) {
+  // To serialize access to DB / fields. Is processEntry called serially?
+  //log.Printf("processEntry")
+  dbmux.Lock()
+
+  s.latestCrp = s.crpHash(entry.Source)
+  sigl := s.siglHash(entry.Source)
+  log.Printf("CRP %v %v %v", entry.Source.Corpus, entry.Source.Root, entry.Source.Path)
+  batchLen := len(s.batch)
+  if batchLen == 0 || s.sigl == sigl {
+    if batchLen == 0 {
+      s.sigl = sigl
+    }
     switch entry.FactName {
     case facts.NodeKind:
       s.kind = schema.NodeKind(string(entry.FactValue))
+      //log.Printf("recording node kind %v", s.kind)
     case facts.AnchorStart:
       if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
         s.startByte = b
@@ -98,100 +121,97 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
     switch entry.EdgeKind {
     case "":
     case edges.ChildOf:
-      s.childofSigl = s.siglHash(entry.Target)
+      //s.childofSigl = s.siglHash(entry.Target)
     default:
       s.batch = append(s.batch, entry)
     }
   } else {
     s.finalizeBatch()
+    dbmux.Unlock()
     return s.processEntry(entry)
   }
+  dbmux.Unlock()
   return nil;
 }
 
-func (s *BatchState) crpHash(v *spb.VName) uint64 {
+func (s *BatchState) crpHash(v *spb.VName) int64 {
   s.hasher.Reset()
   s.hasher.Write([]byte(v.Corpus))
   s.hasher.Write([]byte(v.Root))
   s.hasher.Write([]byte(v.Path))
-  return s.hasher.Sum64() >> 1
+  return int64(s.hasher.Sum64() >> 1)
 }
 
-func (s *BatchState) siglHash(v *spb.VName) uint64 {
+func (s *BatchState) siglHash(v *spb.VName) int64 {
   s.hasher.Reset()
   s.hasher.Write([]byte(v.Signature))
   s.hasher.Write([]byte(v.Language))
-  return s.hasher.Sum64() >> 1
+  return int64(s.hasher.Sum64() >> 1)
 }
 
 func (s *BatchState) finalizeBatch() {
+  //log.Printf("finalizeBatch")
   rep := s.batch[0]
   src := rep.Source
   pathHash := s.crpHash(src)
   sigHash := s.siglHash(src)
 
+  if pathHash != s.latestCrp {
+    //log.Printf("differing path hash")
+    log.Printf("sigls: %v", len(s.sigls))
+    s.dbBatch.Queue("INSERT INTO anchor (crp, sigls, bss, bes, ekinds, tcrps, tsigls) VALUES ($1, $2, $3, $4, $5, $6, $7)", pathHash, s.sigls, s.bss, s.bes, s.ekinds, s.tcrps, s.tsigls)
+
+    s.dbBatchCount += 1
+    s.insertBatch(false)
+
+    s.sigls = make([]int64, 0, 1024)
+    s.ekinds = make([]int32, 0, 1024)
+    s.tcrps = make([]int64, 0, 1024)
+    s.tsigls = make([]int64, 0, 1024)
+    s.bss = make([]int, 0, 1024)
+    s.bes = make([]int, 0, 1024)
+  }
+
   s.batchCounter++
-  shouldRecord := s.batchCounter % 100 < 10
+  shouldRecord := true //s.batchCounter % 100 < 1
 
   if shouldRecord {
+    //log.Printf("shouldRecord")
     // subsampled
-    s.dbBatch.Queue("INSERT INTO crp (crp, corpus, root, path) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", pathHash, rep.Source.Corpus, rep.Source.Root, rep.Source.Path)
+    //s.dbBatch.Queue("INSERT INTO crp (crp, corpus, root, path) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", pathHash, rep.Source.Corpus, rep.Source.Root, rep.Source.Path)
 
   /*
   fmt.Printf("==== Batch for %v (%v : %v) ====\n", src, pathHash, sigHash)
   fmt.Printf("%v %v %v %v\n", s.kind, s.startByte, s.endByte, s.childofSigl)
   */
 
-    // First try: same data, but in arrays instead separate rows.
-    ekinds := make([]int32, 0, 5)
-    tcrps := make([]uint64, 0, 5)
-    tsigls := make([]uint64, 0, 5)
     if s.kind == scpb.NodeKind_ANCHOR {
       for _, e := range s.batch {
+        //log.Printf("iter")
         ekind := schema.EdgeKind(string(e.EdgeKind))
         tcrp := s.crpHash(e.Target)
         tsigl := s.siglHash(e.Target)
 
-        ekinds = append(ekinds, int32(ekind))
-        tcrps = append(tcrps, tcrp)
-        tsigls = append(tsigls, tsigl)
-
-         // CREATE TABLE anchor_old (crp bigint NOT NULL, sigl bigint NOT NULL, psigl bigint NOT NULL, bs int NOT NULL, be int NOT NULL, ekind int NOT NULL, tcrp bigint NOT NULL, tsigl bigint NOT NULL);
-        //s.dbBatch.Queue("INSERT INTO anchor_old (crp, sigl, psigl, bs, be, ekind, tcrp, tsigl) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", pathHash, sigHash, s.childofSigl, s.startByte, s.endByte, ekind, tcrp, tsigl)
+        s.sigls = append(s.sigls, int64(sigHash))
+        s.bss = append(s.bss, s.startByte)
+        s.bes = append(s.bes, s.endByte)
+        s.ekinds = append(s.ekinds, int32(ekind))
+        s.tcrps = append(s.tcrps, int64(tcrp))
+        s.tsigls = append(s.tsigls, int64(tsigl))
       }
-        //fmt.Printf("%v %v %v\n", ekind, s.crpHash(e.Target), s.siglHash(e.Target))
-
-        /*
-         CREATE TABLE anchor (crp bigint NOT NULL, sigl bigint NOT NULL, psigl bigint NOT NULL, bs int NOT NULL, be int NOT NULL, ekinds int[] NOT NULL, tcrps bigint[] NOT NULL, tsigls bigint[] NOT NULL);
-
-         CREATE TABLE crp (crp BIGINT, corpus TEXT, root TEXT, path TEXT);
-        */
-          // so so we only get crp assignment
-      s.dbBatch.Queue("INSERT INTO anchor (crp, sigl, psigl, bs, be, ekinds, tcrps, tsigls) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", pathHash, sigHash, s.childofSigl, s.startByte, s.endByte, ekinds, tcrps, tsigls)
-
-      s.dbBatchCount += 1
-      s.insertBatch(false)
-      // TODO collect: ref, defines/binding, childof
     }
-
   }
 
-  /*
-  for _, e := range s.batch {
-    fmt.Printf("- %v\n", e.String())
-  }
-  */
-  s.batch = s.batch[:0]
+  s.batch = s.batch[:0]  // TODO rename siglbatch
+  s.sigl = 0
   s.kind = scpb.NodeKind_UNKNOWN_NODE_KIND
   s.startByte = -1
   s.endByte = -1
-  s.childofSigl = 0
+  //s.childofSigl = 0
 }
 
 func (s *BatchState) insertBatch(force bool) {
-  if (force || s.dbBatchCount >= 500) {
-    dbmux.Lock()
-    defer dbmux.Unlock()  // TODO use chans etc
+  if (force || s.dbBatchCount >= 10) {
     br := s.dbConn.SendBatch(context.Background(), s.dbBatch)
     _, err := br.Exec()
     if err != nil {
