@@ -96,7 +96,7 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
 
   s.latestCrp = s.crpHash(entry.Source)
   sigl := s.siglHash(entry.Source)
-  log.Printf("CRP %v %v %v", entry.Source.Corpus, entry.Source.Root, entry.Source.Path)
+  //log.Printf("CRP %v %v %v", entry.Source.Corpus, entry.Source.Root, entry.Source.Path)
   batchLen := len(s.batch)
   if batchLen == 0 || s.sigl == sigl {
     if batchLen == 0 {
@@ -222,6 +222,7 @@ func (s *BatchState) insertBatch(force bool) {
     if err != nil {
       panic(err)
     }
+    s.dbBatch = &pgx.Batch{}
   }
 }
 
