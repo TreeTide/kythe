@@ -587,11 +587,11 @@ func encodeVName(v *spb.VName) ([]byte, error) {
 		return nil, fmt.Errorf("VName contains invalid rune: %q", vNameFieldSep)
 	}
 	return []byte(strings.Join([]string{
-		v.Signature,
 		v.Corpus,
 		v.Root,
 		v.Path,
 		v.Language,
+		v.Signature,
 	}, vNameFieldSep)), nil
 }
 
@@ -605,10 +605,10 @@ func decodeVName(data string) (*spb.VName, error) {
 		return nil, fmt.Errorf("invalid VName encoding: %q", data)
 	}
 	return &spb.VName{
-		Signature: parts[0],
-		Corpus:    parts[1],
-		Root:      parts[2],
-		Path:      parts[3],
-		Language:  parts[4],
+		Corpus:    parts[0],
+		Root:      parts[1],
+		Path:      parts[2],
+		Language:  parts[3],
+		Signature: parts[4],
 	}, nil
 }
