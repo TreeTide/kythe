@@ -9,7 +9,6 @@ require (
 	github.com/apache/beam v2.16.0+incompatible
 	github.com/bazelbuild/rules_go v0.20.3
 	github.com/beevik/etree v1.1.0
-	github.com/coreos/go-systemd v0.0.0-20190719114852-fd7a80b32e1f // indirect
 	github.com/dsnet/compress v0.0.1 // indirect
 	github.com/frankban/quicktest v1.7.2 // indirect
 	github.com/golang/groupcache v0.0.0-20191027212112-611e8accdfc9 // indirect
@@ -24,8 +23,6 @@ require (
 	github.com/jackc/pgx/v4 v4.6.0 // indirect
 	github.com/jmhodges/levigo v1.0.0
 	github.com/jstemmer/go-junit-report v0.9.1 // indirect
-	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
-	github.com/kr/pty v1.1.8 // indirect
 	github.com/mholt/archiver v3.1.1+incompatible
 	github.com/minio/highwayhash v1.0.0
 	github.com/nwaples/rardecode v1.0.0 // indirect
@@ -36,7 +33,6 @@ require (
 	github.com/sergi/go-diff v0.0.0-20180205163309-da645544ed44
 	github.com/sourcegraph/go-langserver v2.0.0+incompatible
 	github.com/sourcegraph/jsonrpc2 v0.0.0-20191113080033-cee7209801bf
-	github.com/stretchr/objx v0.2.0 // indirect
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	go.opencensus.io v0.22.2 // indirect

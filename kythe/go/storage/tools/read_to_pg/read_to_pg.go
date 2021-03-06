@@ -16,6 +16,11 @@
 
 // Binary read_to_pg scans the entries from a specified GraphStore and emits
 // them to a PostgreSQL database for further processing.
+//
+//     CREATE TABLE anchor0 (crp bigint NOT NULL, sigl bigint NOT NULL, bs int NOT NULL, be int NOT NULL, ekind int NOT NULL, tcrp bigint NOT NULL, tsigl bigint NOT NULL);
+//
+//      CREATE INDEX a0_crp ON anchor0(crp);
+//      CREATE INDEX a0_target ON anchor0(tsigl, tcrp);
 package main
 
 import (
@@ -25,6 +30,8 @@ import (
 	"log"
 	"os"
   "strconv"
+
+  "database/sql"
 
 	"kythe.io/kythe/go/services/graphstore"
 	"kythe.io/kythe/go/storage/gsutil"
@@ -65,12 +72,20 @@ func init() {
 
 var dbmux sync.Mutex
 
+const kTupleBatchMax int = 100000
+
 type BatchState struct {
   batchCounter int
   hasher hash.Hash64
   dbConn *pgx.Conn
   dbBatch *pgx.Batch
   dbBatchCount int
+
+  seenCrp map[int64]bool
+  seenSigl map[int64]bool
+
+  anchorEdgeBatch [][]interface{}
+  anchorBatch [][]interface{}
 
   // The crp of the last entry processed. Only used to check
   latestCrp int64
@@ -81,8 +96,10 @@ type BatchState struct {
   kind scpb.NodeKind
   // For kind=anchor
   // (Note: anchors can be incident, so sigl is needed to disambiguate them)
-  startByte int
-  endByte int
+  startByte sql.NullInt32
+  endByte sql.NullInt32
+  snippetStartByte sql.NullInt32
+  snippetEndByte sql.NullInt32
 
   // The entries collected for a given sigl.
   batch []*(spb.Entry)
@@ -98,21 +115,84 @@ type BatchState struct {
   //childofSigl uint64
 }
 
+func initDb(conn *pgx.Conn) error {
+  _, err := conn.Exec(context.Background(), "DROP TABLE anchor")
+  if err != nil {
+    log.Printf("Couldn't DROP anchor table: %v", err)
+  }
+  conn.Exec(context.Background(), "DROP TABLE anchor_edge")
+  conn.Exec(context.Background(), "DROP TABLE crp")
+  if _, err := conn.Exec(context.Background(),
+      "CREATE TABLE anchor (crp bigint NOT NULL, sigl bigint NOT NULL, bs int, be int, ss int, se int)"); err != nil { return err }
+  if _, err := conn.Exec(context.Background(),
+      "CREATE TABLE anchor_edge (crp bigint NOT NULL, sigl bigint NOT NULL, ekind int NOT NULL, tcrp bigint NOT NULL, tsigl bigint NOT NULL)"); err != nil { return err }
+
+  if _, err := conn.Exec(context.Background(),
+      "CREATE TABLE crp (crp bigint NOT NULL, corpus TEXT, root TEXT, path TEXT)"); err != nil { return err }
+  return nil
+  /*
+  CREATE TABLE crp (crp BIGINT NOT NULL, corpus TEXT, root TEXT, path TEXT);
+  */
+}
+
+func (s* BatchState) maybeRecordCrpSigl(vname *spb.VName, crp int64, sigl int64) {
+  _, hasCrp := s.seenCrp[crp]
+  if !hasCrp {
+    s.seenCrp[crp] = true
+    s.dbBatch.Queue(
+      "INSERT INTO crp (crp, corpus, root, path) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+      crp, vname.Corpus, vname.Root, vname.Path)
+    s.dbBatchCount++
+  }
+
+  /* Seeing sing has not much value, except the language (which could be added separately?).
+  _, hasSigl := s.seenSigl[sigl]
+  if !hasSigl {
+    s.seenSigl[sigl] = true
+    s.dbBatch.Queue(
+      "INSERT INTO sigl (sigl, signature, language) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+      sigl, vname.Signature, vname.Language)
+    s.dbBatchCount++
+  }
+  */
+
+  s.maybeFlush(false)
+}
+
+func (s* BatchState) maybeFlush(force bool) {
+  if force || s.dbBatchCount > 100 {
+    log.Printf("Flushing batch of crp&sigl")
+    br := s.dbConn.SendBatch(context.Background(), s.dbBatch)
+    _, err := br.Exec()
+    if err != nil {
+      panic(err)
+    }
+    err = br.Close()
+    if err != nil {
+      panic(err)
+    }
+    s.dbBatch = &pgx.Batch{}
+    s.dbBatchCount = 0
+  }
+}
+
 func (s *BatchState) processEntry(entry *spb.Entry) error {
   // To serialize access to DB / fields. Is processEntry called serially?
   //log.Printf("processEntry")
   dbmux.Lock()
 
-  s.latestCrp = s.crpHash(entry.Source)
+  crp := s.crpHash(entry.Source)
   sigl := s.siglHash(entry.Source)
+
+  s.maybeRecordCrpSigl(entry.Source, crp, sigl)
+
   //log.Printf("CRP %v %v %v", entry.Source.Corpus, entry.Source.Root, entry.Source.Path)
   batchLen := len(s.batch)
-  // TODO: shouldn't we check crp equality as well? Not likely to have a
-  // collision, but who knows.
-  if batchLen == 0 || s.sigl == sigl {
+  if batchLen == 0 || (s.sigl == sigl && s.latestCrp == crp) {
     if batchLen == 0 {
       s.sigl = sigl
-      log.Printf("Processing new sig %v (%v)", entry.Source, sigl)
+      s.latestCrp = crp
+      //log.Printf("Processing new sig %v (%v)", entry.Source, sigl)
     }
     switch entry.FactName {
     case facts.NodeKind:
@@ -120,11 +200,23 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
       //log.Printf("recording node kind %v", s.kind)
     case facts.AnchorStart:
       if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
-        s.startByte = b
+        s.startByte.Int32 = int32(b)
+        s.startByte.Valid = true
       }
     case facts.AnchorEnd:
       if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
-        s.endByte = b
+        s.endByte.Int32 = int32(b)
+        s.endByte.Valid = true
+      }
+    case facts.SnippetStart:
+      if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
+        s.snippetStartByte.Int32 = int32(b)
+        s.snippetStartByte.Valid = true
+      }
+    case facts.SnippetEnd:
+      if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
+        s.snippetEndByte.Int32 = int32(b)
+        s.snippetEndByte.Valid = true
       }
     default:
       // eh
@@ -164,36 +256,21 @@ func (s *BatchState) siglHash(v *spb.VName) int64 {
   return int64(s.hasher.Sum64() >> 1)
 }
 
-// Accumulates crp-level data into the arrays, and adds them to DB batch if crp
-// changes. Lazily invokes insertion of the DB batch as well.
+// Accumulates crp+sigl-level data into the arrays.
 func (s *BatchState) finalizeBatch() {
   //log.Printf("finalizeBatch")
-  rep := s.batch[0]
-  src := rep.Source
-  pathHash := s.crpHash(src)
-  sigHash := s.siglHash(src)
+  //rep := s.batch[0]
+  //src := rep.Source
 
-  if pathHash != s.latestCrp {
-    //log.Printf("differing path hash")
-    log.Printf("sigls: %v for crp %v (%v : %v)", len(s.sigls), src, pathHash, sigHash)
-    s.dbBatch.Queue(
-      "INSERT INTO crp (crp, corpus, root, path) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-      pathHash, rep.Source.Corpus, rep.Source.Root, rep.Source.Path)
-    s.dbBatch.Queue(
-      "INSERT INTO anchor (crp, sigls, bss, bes, ekinds, tcrps, tsigls) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-      pathHash, s.sigls, s.bss, s.bes, s.ekinds, s.tcrps, s.tsigls)
+  //log.Printf("differing path hash")
+  //log.Printf("sigls: %v for crp %v (%v : %v)", len(s.sigls), src, pathHash, sigHash)
 
-    s.dbBatchCount += 1
-    s.insertBatch(false)
-
-    // Reset crp accumulators
-    s.sigls = make([]int64, 0, 1024)
-    s.ekinds = make([]int32, 0, 1024)
-    s.tcrps = make([]int64, 0, 1024)
-    s.tsigls = make([]int64, 0, 1024)
-    s.bss = make([]int, 0, 1024)
-    s.bes = make([]int, 0, 1024)
-  }
+  // TODO: local LRU cache for crp, only insert if not found in cache
+  //
+  //s.dbBatch.Queue(
+  //  "INSERT INTO crp (crp, corpus, root, path) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+  //  pathHash, rep.Source.Corpus, rep.Source.Root, rep.Source.Path)
+  s.insertBatch(false)
 
   s.batchCounter++
   shouldRecord := true //s.batchCounter % 100 < 1
@@ -202,47 +279,72 @@ func (s *BatchState) finalizeBatch() {
     //log.Printf("shouldRecord")
     //fmt.Printf("%v %v %v %v\n", s.kind, s.startByte, s.endByte, s.childofSigl)
 
-    if s.kind == scpb.NodeKind_ANCHOR {
+      s.anchorBatch = append(s.anchorBatch,
+        []interface{}{int64(s.latestCrp), int64(s.sigl), s.startByte, s.endByte, s.snippetStartByte, s.snippetEndByte})
+
+    //if s.kind == scpb.NodeKind_ANCHOR {
       for _, e := range s.batch {
         ekind := schema.EdgeKind(string(e.EdgeKind))
+        if ekind == 0 {
+          // Dotted param edge - skip for now. Might check to be sure.
+          continue
+        }
         tcrp := s.crpHash(e.Target)
         tsigl := s.siglHash(e.Target)
 
-        s.sigls = append(s.sigls, int64(sigHash))
-        s.bss = append(s.bss, s.startByte)
-        s.bes = append(s.bes, s.endByte)
-        s.ekinds = append(s.ekinds, int32(ekind))
-        s.tcrps = append(s.tcrps, int64(tcrp))
-        s.tsigls = append(s.tsigls, int64(tsigl))
+        s.maybeRecordCrpSigl(e.Target, tcrp, tsigl)
+
+        s.anchorEdgeBatch = append(s.anchorEdgeBatch,
+          []interface{}{int64(s.latestCrp), int64(s.sigl), int32(ekind), int64(tcrp), int64(tsigl)})
       }
-    }
+    //}
   }
 
   // Reset sigl accum
   s.batch = s.batch[:0]  // TODO rename siglbatch
-  s.sigl = 0
+  s.sigl = -1
+  s.latestCrp = -1
   s.kind = scpb.NodeKind_UNKNOWN_NODE_KIND
-  s.startByte = -1
-  s.endByte = -1
+  s.startByte.Valid = false
+  s.endByte.Valid = false
+  s.snippetStartByte.Valid = false
+  s.snippetEndByte.Valid = false
   //s.childofSigl = 0
 }
 
 // Sends current DB batch if forced or certain thresholds are reached.
 // Note: could make async?
 func (s *BatchState) insertBatch(force bool) {
-  if (force || s.dbBatchCount >= 10) {
-    br := s.dbConn.SendBatch(context.Background(), s.dbBatch)
-    _, err := br.Exec()
+  if (force || len(s.anchorEdgeBatch) >= kTupleBatchMax) {
+    copyCount, err := s.dbConn.CopyFrom(context.Background(),
+      []string{"anchor_edge"},
+      []string{"crp", "sigl",  "ekind", "tcrp", "tsigl"},
+      pgx.CopyFromRows(s.anchorEdgeBatch))
     if err != nil {
       panic(err)
     }
-    s.dbBatchCount = 0
-    err = br.Close()
-    if err != nil {
-      panic(err)
+    if copyCount != int64(len(s.anchorEdgeBatch)) {
+      log.Fatalf("Written count didn't match expected")
     }
-    s.dbBatch = &pgx.Batch{}
+    log.Printf("Copied %v anchor_edge rows", copyCount)
+    s.anchorEdgeBatch = s.anchorEdgeBatch[:0]
   }
+
+  if (force || len(s.anchorBatch) >= kTupleBatchMax) {
+    copyCount, err := s.dbConn.CopyFrom(context.Background(),
+      []string{"anchor"},
+      []string{"crp", "sigl", "bs", "be", "ss", "se"},
+      pgx.CopyFromRows(s.anchorBatch))
+    if err != nil {
+      panic(err)
+    }
+    if copyCount != int64(len(s.anchorBatch)) {
+      log.Fatalf("Written count didn't match expected")
+    }
+    log.Printf("Copied %v anchor rows", copyCount)
+    s.anchorBatch = s.anchorBatch[:0]
+  }
+
 }
 
 func main() {
@@ -259,11 +361,24 @@ func main() {
   }
   defer conn.Close(ctx)
 
+  log.Printf("Initing DB from scratch")
+  if err := initDb(conn); err != nil {
+    panic(err)
+  }
+
   batch := BatchState {
     dbConn: conn,
     dbBatch: &pgx.Batch{},
     hasher: fnv.New64a(),
     batch: make([]*spb.Entry, 0, 100),
+    anchorEdgeBatch: make([][]interface{}, 0, kTupleBatchMax),
+    anchorBatch: make([][]interface{}, 0, kTupleBatchMax),
+    seenCrp: make(map[int64]bool),
+    seenSigl: make(map[int64]bool),
+    startByte: sql.NullInt32{Int32: 0, Valid: false},
+    endByte: sql.NullInt32{Int32: 0, Valid: false},
+    snippetStartByte: sql.NullInt32{Int32: 0, Valid: false},
+    snippetEndByte: sql.NullInt32{Int32: 0, Valid: false},
   }
   if len(flag.Args()) > 0 {
     if *targetTicket != "" || *factPrefix != "" {
@@ -277,9 +392,9 @@ func main() {
       log.Fatal(err)
     }
   }
-  batch.latestCrp = 0  // to force finalizing the the current crp
   batch.finalizeBatch()
   batch.insertBatch(true)
+  batch.maybeFlush(true)
 }
 
 func readEntries(ctx context.Context, gs graphstore.Service, entryFunc graphstore.EntryFunc, edgeKind string, tickets []string) error {
@@ -316,3 +431,4 @@ func scanEntries(ctx context.Context, gs graphstore.Service, entryFunc graphstor
 	}
 	return nil
 }
+
