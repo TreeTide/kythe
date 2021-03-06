@@ -39,7 +39,7 @@ import (
 	"kythe.io/kythe/go/util/kytheuri"
 	"kythe.io/kythe/go/util/schema"
 	"kythe.io/kythe/go/util/schema/facts"
-	"kythe.io/kythe/go/util/schema/edges"
+	//"kythe.io/kythe/go/util/schema/edges"
 
   scpb "kythe.io/kythe/proto/schema_go_proto"
 	spb "kythe.io/kythe/proto/storage_go_proto"
@@ -98,6 +98,10 @@ type BatchState struct {
   // (Note: anchors can be incident, so sigl is needed to disambiguate them)
   startByte sql.NullInt32
   endByte sql.NullInt32
+  // For kind=file
+  textFact []byte
+  textEncodingFact *string
+  languageFact *string
 
   // The entries collected for a given sigl.
   batch []*(spb.Entry)
@@ -110,7 +114,6 @@ type BatchState struct {
   tsigls []int64
   bss []int
   bes []int
-  //childofSigl uint64
 }
 
 func initDb(conn *pgx.Conn) error {
@@ -120,6 +123,7 @@ func initDb(conn *pgx.Conn) error {
   }
   conn.Exec(context.Background(), "DROP TABLE anchor_edge")
   conn.Exec(context.Background(), "DROP TABLE crp")
+  conn.Exec(context.Background(), "DROP TABLE file")
   if _, err := conn.Exec(context.Background(),
       "CREATE TABLE anchor (crp bigint NOT NULL, sigl bigint NOT NULL, bs int, be int)"); err != nil { return err }
   if _, err := conn.Exec(context.Background(),
@@ -127,10 +131,9 @@ func initDb(conn *pgx.Conn) error {
 
   if _, err := conn.Exec(context.Background(),
       "CREATE TABLE crp (crp bigint NOT NULL, corpus TEXT, root TEXT, path TEXT)"); err != nil { return err }
+  if _, err := conn.Exec(context.Background(),
+      "CREATE TABLE file (crp bigint NOT NULL, content BYTEA, encoding TEXT, language TEXT)"); err != nil { return err }
   return nil
-  /*
-  CREATE TABLE crp (crp BIGINT NOT NULL, corpus TEXT, root TEXT, path TEXT);
-  */
 }
 
 func (s* BatchState) maybeRecordCrpSigl(vname *spb.VName, crp int64, sigl int64) {
@@ -196,6 +199,14 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
     case facts.NodeKind:
       s.kind = schema.NodeKind(string(entry.FactValue))
       //log.Printf("recording node kind %v", s.kind)
+    case facts.Text:
+      s.textFact = entry.FactValue
+    case facts.TextEncoding:
+      te := string(entry.FactValue)
+      s.textEncodingFact = &te
+    //case facts.Language:  // schema mentions but apperntly no such
+    //  l := string(entry.FactValue)
+    //  s.languageFact = &l
     case facts.AnchorStart:
       if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
         s.startByte.Int32 = int32(b)
@@ -213,8 +224,12 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
 
     switch entry.EdgeKind {
     case "":
-    case edges.ChildOf:
-      //s.childofSigl = s.siglHash(entry.Target)
+      if batchLen == 0 {
+        // Create a fake batch entry for the file, so the facts get recorded.
+        // Needed if the node wouldn't have any edges otherwise (like file
+        // nodes).
+        s.batch = append(s.batch, entry)
+      }
     default:
       s.batch = append(s.batch, entry)
     }
@@ -265,28 +280,45 @@ func (s *BatchState) finalizeBatch() {
   shouldRecord := true //s.batchCounter % 100 < 1
 
   if shouldRecord {
-    //log.Printf("shouldRecord")
-    //fmt.Printf("%v %v %v %v\n", s.kind, s.startByte, s.endByte, s.childofSigl)
+    if (s.kind == scpb.NodeKind_ANCHOR || s.kind == scpb.NodeKind_FILE) {
 
-      s.anchorBatch = append(s.anchorBatch,
-        []interface{}{int64(s.latestCrp), int64(s.sigl), s.startByte, s.endByte})
+      switch s.kind {
+        case scpb.NodeKind_ANCHOR:
+        s.anchorBatch = append(s.anchorBatch,
+          []interface{}{int64(s.latestCrp), int64(s.sigl), s.startByte, s.endByte})
+        case scpb.NodeKind_FILE:
+          s.dbBatch.Queue(
+            "INSERT INTO file (crp, content, encoding, language) VALUES ($1, $2, $3, $4)",
+            s.latestCrp, s.textFact, s.textEncodingFact, s.languageFact)
+          s.dbBatchCount++
 
-    //if s.kind == scpb.NodeKind_ANCHOR {
+        default:
+          // pass
+      }
+
       for _, e := range s.batch {
+        if e.EdgeKind == "" {
+          continue
+        }
         ekind := schema.EdgeKind(string(e.EdgeKind))
         if ekind == 0 {
-          // Dotted param edge - skip for now. Might check to be sure.
-          continue
+          // Dotted param edge, write as zero edge for now, will need to
+          // assign some special numbers later.
         }
         tcrp := s.crpHash(e.Target)
         tsigl := s.siglHash(e.Target)
 
         s.maybeRecordCrpSigl(e.Target, tcrp, tsigl)
 
-        s.anchorEdgeBatch = append(s.anchorEdgeBatch,
-          []interface{}{int64(s.latestCrp), int64(s.sigl), int32(ekind), int64(tcrp), int64(tsigl)})
+        switch s.kind {
+        case scpb.NodeKind_ANCHOR:
+            s.anchorEdgeBatch = append(s.anchorEdgeBatch,
+              []interface{}{int64(s.latestCrp), int64(s.sigl), int32(ekind), int64(tcrp), int64(tsigl)})
+        default:
+          // pass
+        }
       }
-    //}
+    }
   }
 
   // Reset sigl accum
@@ -296,7 +328,9 @@ func (s *BatchState) finalizeBatch() {
   s.kind = scpb.NodeKind_UNKNOWN_NODE_KIND
   s.startByte.Valid = false
   s.endByte.Valid = false
-  //s.childofSigl = 0
+  s.textFact = []byte{}
+  s.textEncodingFact = nil
+  s.languageFact = nil
 }
 
 // Sends current DB batch if forced or certain thresholds are reached.
