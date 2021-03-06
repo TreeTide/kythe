@@ -98,8 +98,6 @@ type BatchState struct {
   // (Note: anchors can be incident, so sigl is needed to disambiguate them)
   startByte sql.NullInt32
   endByte sql.NullInt32
-  snippetStartByte sql.NullInt32
-  snippetEndByte sql.NullInt32
 
   // The entries collected for a given sigl.
   batch []*(spb.Entry)
@@ -123,7 +121,7 @@ func initDb(conn *pgx.Conn) error {
   conn.Exec(context.Background(), "DROP TABLE anchor_edge")
   conn.Exec(context.Background(), "DROP TABLE crp")
   if _, err := conn.Exec(context.Background(),
-      "CREATE TABLE anchor (crp bigint NOT NULL, sigl bigint NOT NULL, bs int, be int, ss int, se int)"); err != nil { return err }
+      "CREATE TABLE anchor (crp bigint NOT NULL, sigl bigint NOT NULL, bs int, be int)"); err != nil { return err }
   if _, err := conn.Exec(context.Background(),
       "CREATE TABLE anchor_edge (crp bigint NOT NULL, sigl bigint NOT NULL, ekind int NOT NULL, tcrp bigint NOT NULL, tsigl bigint NOT NULL)"); err != nil { return err }
 
@@ -208,16 +206,7 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
         s.endByte.Int32 = int32(b)
         s.endByte.Valid = true
       }
-    case facts.SnippetStart:
-      if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
-        s.snippetStartByte.Int32 = int32(b)
-        s.snippetStartByte.Valid = true
-      }
-    case facts.SnippetEnd:
-      if b, err := strconv.Atoi(string(entry.FactValue)); err == nil {
-        s.snippetEndByte.Int32 = int32(b)
-        s.snippetEndByte.Valid = true
-      }
+    // Note: snippet bounds are not stored in graphstore.
     default:
       // eh
     }
@@ -280,7 +269,7 @@ func (s *BatchState) finalizeBatch() {
     //fmt.Printf("%v %v %v %v\n", s.kind, s.startByte, s.endByte, s.childofSigl)
 
       s.anchorBatch = append(s.anchorBatch,
-        []interface{}{int64(s.latestCrp), int64(s.sigl), s.startByte, s.endByte, s.snippetStartByte, s.snippetEndByte})
+        []interface{}{int64(s.latestCrp), int64(s.sigl), s.startByte, s.endByte})
 
     //if s.kind == scpb.NodeKind_ANCHOR {
       for _, e := range s.batch {
@@ -307,8 +296,6 @@ func (s *BatchState) finalizeBatch() {
   s.kind = scpb.NodeKind_UNKNOWN_NODE_KIND
   s.startByte.Valid = false
   s.endByte.Valid = false
-  s.snippetStartByte.Valid = false
-  s.snippetEndByte.Valid = false
   //s.childofSigl = 0
 }
 
@@ -333,7 +320,7 @@ func (s *BatchState) insertBatch(force bool) {
   if (force || len(s.anchorBatch) >= kTupleBatchMax) {
     copyCount, err := s.dbConn.CopyFrom(context.Background(),
       []string{"anchor"},
-      []string{"crp", "sigl", "bs", "be", "ss", "se"},
+      []string{"crp", "sigl", "bs", "be"},
       pgx.CopyFromRows(s.anchorBatch))
     if err != nil {
       panic(err)
@@ -377,8 +364,6 @@ func main() {
     seenSigl: make(map[int64]bool),
     startByte: sql.NullInt32{Int32: 0, Valid: false},
     endByte: sql.NullInt32{Int32: 0, Valid: false},
-    snippetStartByte: sql.NullInt32{Int32: 0, Valid: false},
-    snippetEndByte: sql.NullInt32{Int32: 0, Valid: false},
   }
   if len(flag.Args()) > 0 {
     if *targetTicket != "" || *factPrefix != "" {
