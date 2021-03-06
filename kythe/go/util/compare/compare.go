@@ -216,7 +216,7 @@ var (
 // lexicographic comparison of [signature, corpus, root, path, language].
 func VNames(v1, v2 *spb.VName) Order {
 	return Seq(v1, v2,
-		ByVNameCorpus, ByVNameRoot, ByVNamePath, ByVNameLanguage, ByVNameSignature)
+		ByVNameSignature, ByVNameCorpus, ByVNameRoot, ByVNamePath, ByVNameLanguage)
 }
 
 // VNamesEqual reports whether v1 and v2 are equal.

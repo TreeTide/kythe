@@ -72,14 +72,23 @@ type BatchState struct {
   dbBatch *pgx.Batch
   dbBatchCount int
 
+  // The crp of the last entry processed. Only used to check
   latestCrp int64
+  // The sigl of the first entry in the batch.
   sigl int64
-  batch []*(spb.Entry)
 
+  // Facts collected while scanning entries of a single sigl.
   kind scpb.NodeKind
+  // For kind=anchor
+  // (Note: anchors can be incident, so sigl is needed to disambiguate them)
   startByte int
   endByte int
 
+  // The entries collected for a given sigl.
+  batch []*(spb.Entry)
+
+  // Accumulates stuff for a given crp.
+  // For kind=anchor
   sigls []int64
   ekinds []int32
   tcrps []int64
@@ -98,9 +107,12 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
   sigl := s.siglHash(entry.Source)
   //log.Printf("CRP %v %v %v", entry.Source.Corpus, entry.Source.Root, entry.Source.Path)
   batchLen := len(s.batch)
+  // TODO: shouldn't we check crp equality as well? Not likely to have a
+  // collision, but who knows.
   if batchLen == 0 || s.sigl == sigl {
     if batchLen == 0 {
       s.sigl = sigl
+      log.Printf("Processing new sig %v (%v)", entry.Source, sigl)
     }
     switch entry.FactName {
     case facts.NodeKind:
@@ -126,6 +138,8 @@ func (s *BatchState) processEntry(entry *spb.Entry) error {
       s.batch = append(s.batch, entry)
     }
   } else {
+    // Entries of a new entity begin, so finish extracting info from current
+    // batch.
     s.finalizeBatch()
     dbmux.Unlock()
     return s.processEntry(entry)
@@ -139,6 +153,7 @@ func (s *BatchState) crpHash(v *spb.VName) int64 {
   s.hasher.Write([]byte(v.Corpus))
   s.hasher.Write([]byte(v.Root))
   s.hasher.Write([]byte(v.Path))
+  // Shifting probably to make output fit postgres's int8 type?
   return int64(s.hasher.Sum64() >> 1)
 }
 
@@ -149,6 +164,8 @@ func (s *BatchState) siglHash(v *spb.VName) int64 {
   return int64(s.hasher.Sum64() >> 1)
 }
 
+// Accumulates crp-level data into the arrays, and adds them to DB batch if crp
+// changes. Lazily invokes insertion of the DB batch as well.
 func (s *BatchState) finalizeBatch() {
   //log.Printf("finalizeBatch")
   rep := s.batch[0]
@@ -158,12 +175,18 @@ func (s *BatchState) finalizeBatch() {
 
   if pathHash != s.latestCrp {
     //log.Printf("differing path hash")
-    log.Printf("sigls: %v", len(s.sigls))
-    s.dbBatch.Queue("INSERT INTO anchor (crp, sigls, bss, bes, ekinds, tcrps, tsigls) VALUES ($1, $2, $3, $4, $5, $6, $7)", pathHash, s.sigls, s.bss, s.bes, s.ekinds, s.tcrps, s.tsigls)
+    log.Printf("sigls: %v for crp %v (%v : %v)", len(s.sigls), src, pathHash, sigHash)
+    s.dbBatch.Queue(
+      "INSERT INTO crp (crp, corpus, root, path) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+      pathHash, rep.Source.Corpus, rep.Source.Root, rep.Source.Path)
+    s.dbBatch.Queue(
+      "INSERT INTO anchor (crp, sigls, bss, bes, ekinds, tcrps, tsigls) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+      pathHash, s.sigls, s.bss, s.bes, s.ekinds, s.tcrps, s.tsigls)
 
     s.dbBatchCount += 1
     s.insertBatch(false)
 
+    // Reset crp accumulators
     s.sigls = make([]int64, 0, 1024)
     s.ekinds = make([]int32, 0, 1024)
     s.tcrps = make([]int64, 0, 1024)
@@ -177,17 +200,10 @@ func (s *BatchState) finalizeBatch() {
 
   if shouldRecord {
     //log.Printf("shouldRecord")
-    // subsampled
-    //s.dbBatch.Queue("INSERT INTO crp (crp, corpus, root, path) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", pathHash, rep.Source.Corpus, rep.Source.Root, rep.Source.Path)
-
-  /*
-  fmt.Printf("==== Batch for %v (%v : %v) ====\n", src, pathHash, sigHash)
-  fmt.Printf("%v %v %v %v\n", s.kind, s.startByte, s.endByte, s.childofSigl)
-  */
+    //fmt.Printf("%v %v %v %v\n", s.kind, s.startByte, s.endByte, s.childofSigl)
 
     if s.kind == scpb.NodeKind_ANCHOR {
       for _, e := range s.batch {
-        //log.Printf("iter")
         ekind := schema.EdgeKind(string(e.EdgeKind))
         tcrp := s.crpHash(e.Target)
         tsigl := s.siglHash(e.Target)
@@ -202,6 +218,7 @@ func (s *BatchState) finalizeBatch() {
     }
   }
 
+  // Reset sigl accum
   s.batch = s.batch[:0]  // TODO rename siglbatch
   s.sigl = 0
   s.kind = scpb.NodeKind_UNKNOWN_NODE_KIND
@@ -210,6 +227,8 @@ func (s *BatchState) finalizeBatch() {
   //s.childofSigl = 0
 }
 
+// Sends current DB batch if forced or certain thresholds are reached.
+// Note: could make async?
 func (s *BatchState) insertBatch(force bool) {
   if (force || s.dbBatchCount >= 10) {
     br := s.dbConn.SendBatch(context.Background(), s.dbBatch)
@@ -258,6 +277,7 @@ func main() {
       log.Fatal(err)
     }
   }
+  batch.latestCrp = 0  // to force finalizing the the current crp
   batch.finalizeBatch()
   batch.insertBatch(true)
 }
